@@ -17,8 +17,11 @@ LOGO_URL = "https://romandeassure.ch/cus-assets/images/logo-romandeassure.png"
 CONFIG = {
     "balancing": {
         "enabled": True,
-        "strategy": "weighted_random",
+        "strategy": "weighted_random",  # weighted_random | historical | window_deficit
         "receivers": [{"email": DEFAULT_TO, "pourcentage": 100}],
+        "window": {"mode": "leads", "size": 500},
+        "bootstrap_factor": 0.5,
+        "explore_prob": 0.15,
     }
 }
 
@@ -48,7 +51,8 @@ def init_db():
             prenom TEXT, nom TEXT, telephone TEXT,
             whatsapp INTEGER, consentement INTEGER,
             routed_to TEXT,
-            payload_json TEXT NOT NULL
+            payload_json TEXT NOT NULL,
+            email_sent INTEGER NOT NULL DEFAULT 0
         )
         """)
         con.execute("""
@@ -60,6 +64,16 @@ def init_db():
         )
         """)
         con.commit()
+    finally:
+        con.close()
+
+def add_columns_if_missing():
+    con = sqlite3.connect(DB_PATH)
+    try:
+        cols = [r[1] for r in con.execute("PRAGMA table_info(leads)").fetchall()]
+        if "email_sent" not in cols:
+            con.execute("ALTER TABLE leads ADD COLUMN email_sent INTEGER NOT NULL DEFAULT 0")
+            con.commit()
     finally:
         con.close()
 
@@ -112,6 +126,15 @@ def inc_stat(email: str, success: bool):
 # === CONFIG LOADER ===
 def load_config():
     global CONFIG
+    # Valeurs par défaut
+    default = {
+        "enabled": True,
+        "strategy": "weighted_random",
+        "receivers": [{"email": DEFAULT_TO, "pourcentage": 100}],
+        "window": {"mode": "leads", "size": 500},
+        "bootstrap_factor": 0.5,
+        "explore_prob": 0.15,
+    }
     if os.path.exists(CONFIG_PATH):
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
@@ -137,21 +160,22 @@ def load_config():
 
         CONFIG = {
             "balancing": {
-                "enabled": bool(bal.get("enabled", True)),
-                "strategy": bal.get("strategy", "weighted_random"),
+                "enabled": bool(bal.get("enabled", default["enabled"])),
+                "strategy": str(bal.get("strategy", default["strategy"])),
                 "receivers": receivers,
+                "window": {
+                    "mode": (bal.get("window", {}) or {}).get("mode", default["window"]["mode"]),
+                    "size": int((bal.get("window", {}) or {}).get("size", default["window"]["size"])),
+                },
+                "bootstrap_factor": float(bal.get("bootstrap_factor", default["bootstrap_factor"])),
+                "explore_prob": float(bal.get("explore_prob", default["explore_prob"])),
             }
         }
     else:
-        CONFIG = {
-            "balancing": {
-                "enabled": True,
-                "strategy": "weighted_random",
-                "receivers": [{"email": DEFAULT_TO, "pourcentage": 100}],
-            }
-        }
+        CONFIG = {"balancing": default}
 
-def pick_recipient() -> str:
+# === ELECTION DU DESTINATAIRE ===
+def pick_recipient_weighted() -> str:
     bal = CONFIG["balancing"]
     if not bal.get("enabled", True):
         return DEFAULT_TO
@@ -160,6 +184,151 @@ def pick_recipient() -> str:
         return DEFAULT_TO
     weights = [r["pourcentage"] for r in recs]
     return random.choices([r["email"] for r in recs], weights=weights, k=1)[0]
+
+def _fetch_stats_map():
+    emails_cfg = [r["email"] for r in CONFIG["balancing"]["receivers"] if r.get("pourcentage", 0) > 0]
+    if not emails_cfg:
+        return {}
+    qmarks = ",".join("?" for _ in emails_cfg)
+    con = sqlite3.connect(DB_PATH)
+    try:
+        rows = con.execute(
+            f"SELECT email, sent_count FROM recipients_stats WHERE email IN ({qmarks})",
+            emails_cfg
+        ).fetchall()
+        m = {r[0]: r[1] for r in rows}
+        for e in emails_cfg:
+            m.setdefault(e, 0)
+        return m
+    finally:
+        con.close()
+
+def pick_recipient_historical() -> str:
+    """
+    Mantiene el % global (histórico total): elige el email con mayor déficit frente a su cuota.
+    """
+    bal = CONFIG["balancing"]
+    if not bal.get("enabled", True):
+        return DEFAULT_TO
+    recs = [r for r in bal["receivers"] if r.get("pourcentage", 0) > 0]
+    if not recs:
+        return DEFAULT_TO
+
+    stats = _fetch_stats_map()
+    total_sent = sum(stats.get(r["email"], 0) for r in recs)
+
+    if total_sent == 0:
+        return pick_recipient_weighted()
+
+    best_email, best_deficit = None, None
+    for r in recs:
+        email = r["email"]
+        pct = r["pourcentage"] / 100.0
+        actual = stats.get(email, 0)
+        expected = total_sent * pct
+        deficit = expected - actual
+        if (best_deficit is None) or (deficit > best_deficit):
+            best_deficit, best_email = deficit, email
+
+    if best_deficit is not None and best_deficit > 0:
+        return best_email
+
+    # Todos sobre-servidos → el de menor ratio actual/objetivo
+    best_email, best_ratio = None, None
+    for r in recs:
+        email = r["email"]
+        pct = r["pourcentage"] / 100.0
+        actual = stats.get(email, 0)
+        expected = max(1e-9, total_sent * pct)
+        ratio = actual / expected
+        if (best_ratio is None) or (ratio < best_ratio):
+            best_ratio, best_email = ratio, email
+
+    return best_email or pick_recipient_weighted()
+
+def _window_counts_leads(limit_n: int):
+    """Compte {email: count} sur les N DERNIERS leads avec email_sent=1 (fenêtre)."""
+    con = sqlite3.connect(DB_PATH)
+    try:
+        rows = con.execute("""
+            SELECT routed_to FROM leads
+            WHERE email_sent=1
+            ORDER BY id DESC
+            LIMIT ?
+        """, (limit_n,)).fetchall()
+        counts = {}
+        for (email,) in rows:
+            counts[email] = counts.get(email, 0) + 1
+        return counts
+    finally:
+        con.close()
+
+def pick_recipient_window_deficit() -> str:
+    """
+    Applique les pourcentages sur une FENÊTRE (ex: derniers 500 leads).
+    - bootstrap_factor: si un destinataire n'apparaît pas dans la fenêtre, simule part de sa quota.
+    - explore_prob: petite exploration pondérée pour éviter blocages.
+    """
+    bal = CONFIG["balancing"]
+    if not bal.get("enabled", True):
+        return DEFAULT_TO
+    recs = [r for r in bal["receivers"] if r.get("pourcentage", 0) > 0]
+    if not recs:
+        return DEFAULT_TO
+
+    # Exploration aléatoire
+    if random.random() < float(bal.get("explore_prob", 0.15)):
+        return pick_recipient_weighted()
+
+    win = bal.get("window", {}) or {}
+    win_mode = (win.get("mode") or "leads").lower()
+    size = int(win.get("size", 500))
+    if win_mode != "leads":
+        # fallback simple
+        return pick_recipient_weighted()
+
+    counts = _window_counts_leads(size)
+    total = sum(counts.values())
+    if total == 0:
+        return pick_recipient_weighted()
+
+    bootstrap = float(bal.get("bootstrap_factor", 0.5))
+    best_email, best_deficit = None, None
+
+    for r in recs:
+        email = r["email"]
+        pct = r["pourcentage"] / 100.0
+        actual = counts.get(email, None)
+        if actual is None:
+            actual = total * pct * bootstrap  # arranque virtual
+        expected = total * pct
+        deficit = expected - actual
+        if (best_deficit is None) or (deficit > best_deficit):
+            best_deficit, best_email = deficit, email
+
+    # Si tous déficit <= 0 → choisir le pire ratio (le plus bas)
+    if best_deficit is not None and best_deficit <= 0:
+        best_email, best_ratio = None, None
+        for r in recs:
+            email = r["email"]
+            pct = r["pourcentage"] / 100.0
+            actual = counts.get(email, 0)
+            expected = max(1e-9, total * pct)
+            ratio = actual / expected
+            if (best_ratio is None) or (ratio < best_ratio):
+                best_ratio, best_email = ratio, email
+
+    return best_email or pick_recipient_weighted()
+
+def pick_recipient() -> str:
+    """Router commun selon la stratégie de config."""
+    strat = (CONFIG.get("balancing") or {}).get("strategy", "weighted_random").lower()
+    if strat == "historical":
+        return pick_recipient_historical()
+    if strat == "window_deficit":
+        return pick_recipient_window_deficit()
+    # default
+    return pick_recipient_weighted()
 
 # === EMAIL (BREVO) ===
 def envoyer_email_brevo(lead: Lead, backup_id: int, to_email: str):
@@ -243,6 +412,7 @@ def envoyer_email_brevo(lead: Lead, backup_id: int, to_email: str):
 @app.on_event("startup")
 def _startup():
     init_db()
+    add_columns_if_missing()
     load_config()
 
 @app.get("/api/sante")
@@ -268,12 +438,23 @@ def balancing_stats():
 
 @app.post("/api/register_lead")
 def enregistrer_lead(lead: Lead, origin: str | None = Header(None)):
+    # Choix du destinataire selon la stratégie de config
     to_email = pick_recipient()
     backup_id = sauvegarder_lead_sqlite(lead, to_email)
+    sent_ok = 0
     try:
         envoyer_email_brevo(lead, backup_id, to_email)
+        sent_ok = 1
         inc_stat(to_email, True)
         return {"ok": True, "backup_id": backup_id, "email_envoye": True, "to": to_email}
     except Exception as e:
         inc_stat(to_email, False)
         return {"ok": True, "backup_id": backup_id, "email_envoye": False, "to": to_email, "erreur": str(e)}
+    finally:
+        # Persiste le résultat d'envoi pour la fenêtre
+        con = sqlite3.connect(DB_PATH)
+        try:
+            con.execute("UPDATE leads SET email_sent=? WHERE id=?", (sent_ok, backup_id))
+            con.commit()
+        finally:
+            con.close()

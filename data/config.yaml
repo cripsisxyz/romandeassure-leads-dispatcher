@@ -1,10 +1,13 @@
-# Chemin par défaut: ./config.yaml (surchargé par ENV: LEADS_CONFIG_PATH)
 balancing:
   enabled: true
-  strategy: weighted_random   # pour l’instant: weighted_random
+  strategy: window_deficit # nueva estrategia
+  window:
+    mode: leads # "leads" o "days" (implementamos "leads" aquí)
+    size: 500 # usa los últimos 500 leads con email enviado OK
+  bootstrap_factor: 0.5 # si un destinatario es nuevo en la ventana, simula que ya tiene el 50% de su cuota
+  explore_prob: 0.15 # 15% de veces elegimos ponderado por porcentaje (exploración)
   receivers:
     - email: "ilan.hasler@orizon.ch"
       pourcentage: 0
     - email: "ivanvazquez96@gmail.com"
       pourcentage: 100
-
