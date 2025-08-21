@@ -391,12 +391,7 @@ def envoyer_email_brevo(lead: Lead, backup_id: int, to_email: str):
         "subject": f"Nouveau lead #{backup_id} - {lead.prenom} {lead.nom}",
         "htmlContent": html,
         "replyTo": {"email": "no-reply@romandeassure.ch"},
-        "headers": {"X-RA-Lead": "register_lead", "X-RA-Backup-ID": str(backup_id)},
-        "attachment": [{
-            "name": f"lead_{backup_id}.json",
-            "content": base64.b64encode(piece_jointe).decode("ascii"),
-            "type": "application/json"
-        }]
+        "headers": {"X-RA-Lead": "register_lead", "X-RA-Backup-ID": str(backup_id)}
     }
 
     r = requests.post(
