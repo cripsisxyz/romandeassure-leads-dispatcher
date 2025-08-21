@@ -8,7 +8,7 @@ services:
       - "8003:8002"
     restart: unless-stopped
     environment:
-      BREVO_API_KEY: "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"
+      BREVO_API_KEY: "${BREVO_API_KEY}"
       LEADS_TO: "romandeassure.ch@gmail.com"
       LEADS_SQLITE_PATH: "/data/leads_backup.db"
       LEADS_CONFIG_PATH: "/config/config.yaml"
