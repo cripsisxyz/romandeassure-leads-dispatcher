@@ -1,0 +1,10 @@
+# Chemin par défaut: ./config.yaml (surchargé par ENV: LEADS_CONFIG_PATH)
+balancing:
+  enabled: true
+  strategy: weighted_random   # pour l’instant: weighted_random
+  receivers:
+    - email: "ilan.hasler@orizon.ch"
+      pourcentage: 0
+    - email: "ivanvazquez96@gmail.com"
+      pourcentage: 100
+

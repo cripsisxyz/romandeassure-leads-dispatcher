@@ -1,0 +1,23 @@
+version: "3.9"
+
+services:
+  ra-leads-dispatcher:
+    build: .
+    container_name: ra-leads-dispatcher
+    ports:
+      - "8003:8002"
+    restart: unless-stopped
+    environment:
+      BREVO_API_KEY: "ton_api_key_brevo"
+      LEADS_TO: "romandeassure.ch@gmail.com"
+      LEADS_SQLITE_PATH: "/data/leads_backup.db"
+      LEADS_CONFIG_PATH: "/config/config.yaml"
+    volumes:
+      - ./data:/data
+      - ./config:/config
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/api/sante"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
